@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/"
+title = "Clearspace Photos"
+description = "A calm, intelligent photo organizer that finds duplicates, surfaces low-value clutter, and helps people make space while protecting the photos worth keeping."
+version = "1.0.0"
+id = "artifacts/clearspace-photos"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 20299
+
+[services.development]
+run = "pnpm --filter @workspace/clearspace-photos run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/clearspace-photos", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/clearspace-photos", "run", "serve" ]
+
+[services.env]
+PORT = "20299"
+BASE_PATH = "/"
