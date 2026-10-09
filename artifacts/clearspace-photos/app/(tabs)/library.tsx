@@ -1,11 +1,11 @@
 import { Feather } from '@expo/vector-icons';
+import { Image } from 'expo-image';
 import { router } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Animated,
-  Image,
   Linking,
   PanResponder,
   Platform,
@@ -514,12 +514,17 @@ export default function LibraryScreen() {
             <View style={styles.cardArea}>
               {groups[groupIndex + 1]?.photos[0] ? (
                 <View style={[styles.stackCard, styles.stackCardBack, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                  <Image source={{ uri: groups[groupIndex + 1].photos[0]?.id }} style={styles.cardImage} />
+                  <Image
+                    source={{ uri: groups[groupIndex + 1].photos[0]?.id }}
+                    style={styles.cardImage}
+                    contentFit="cover"
+                    transition={120}
+                  />
                 </View>
               ) : null}
               {nextPhoto ? (
                 <View style={[styles.stackCard, styles.stackCardMiddle, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                  <Image source={{ uri: nextPhoto.id }} style={styles.cardImage} />
+                  <Image source={{ uri: nextPhoto.id }} style={styles.cardImage} contentFit="cover" transition={120} />
                 </View>
               ) : null}
               <Animated.View
@@ -532,7 +537,7 @@ export default function LibraryScreen() {
                   { transform: [{ translateX: pan.x }, { translateY: pan.y }, { rotate: rotation }] },
                 ]}
               >
-                <Image source={{ uri: currentPhoto.id }} style={styles.cardImage} />
+                <Image source={{ uri: currentPhoto.id }} style={styles.cardImage} contentFit="cover" transition={120} />
                 <View style={styles.imageScrim} />
                 {cardIndex === 0 ? (
                   <View style={[styles.recommendedTag, { backgroundColor: colors.accent }]}>
@@ -752,7 +757,7 @@ const styles = StyleSheet.create({
   stackCardBack: { transform: [{ scale: 0.93 }, { translateY: 18 }], opacity: 0.6 },
   stackCardMiddle: { transform: [{ scale: 0.965 }, { translateY: 9 }], opacity: 0.82 },
   frontCard: { left: 0, right: 0, top: 0, height: 400, borderWidth: 1 },
-  cardImage: { width: '100%', height: '100%', resizeMode: 'cover' },
+  cardImage: { width: '100%', height: '100%' },
   imageScrim: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(15, 22, 23, 0.15)' },
   recommendedTag: { position: 'absolute', left: 14, top: 14, flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 13, paddingHorizontal: 10, paddingVertical: 7 },
   recommendedText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
