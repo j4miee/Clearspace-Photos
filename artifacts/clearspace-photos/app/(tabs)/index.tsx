@@ -1,10 +1,11 @@
 import { Feather } from '@expo/vector-icons';
-import { router } from 'expo-router';
+import { router, type Href } from 'expo-router';
 import React from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
 import { usePhotoLibrary } from '@/context/PhotoLibraryContext';
+import { CLEANUP_CATEGORIES } from '@/lib/cleanup';
 
 export default function HomeScreen() {
   const colors = useColors();
@@ -88,6 +89,30 @@ export default function HomeScreen() {
         </Pressable>
 
         <View style={styles.sectionHeading}>
+          <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Free up space</Text>
+          <Text style={[styles.sectionNote, { color: colors.mutedForeground }]}>ON DEVICE</Text>
+        </View>
+        <View style={styles.tileGrid}>
+          {CLEANUP_CATEGORIES.map((category) => (
+            <Pressable
+              key={category.id}
+              testID={`cleanup-tile-${category.id}`}
+              onPress={() => router.push(`/cleanup/${category.id}` as Href)}
+              style={({ pressed }) => [
+                styles.tile,
+                { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.8 : 1 },
+              ]}
+            >
+              <View style={[styles.tileIcon, { backgroundColor: colors.secondary }]}>
+                <Feather name={category.icon} size={17} color={colors.secondaryForeground} />
+              </View>
+              <Text style={[styles.tileTitle, { color: colors.foreground }]}>{category.title}</Text>
+              <Text style={[styles.tileDetail, { color: colors.mutedForeground }]}>{category.detail}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <View style={styles.sectionHeading}>
           <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Your library</Text>
           <Text style={[styles.sectionNote, { color: colors.mutedForeground }]}>LOCAL ONLY</Text>
         </View>
@@ -98,7 +123,7 @@ export default function HomeScreen() {
           <View style={styles.libraryCopy}>
             <Text style={[styles.libraryTitle, { color: colors.foreground }]}>Nothing leaves your phone</Text>
             <Text style={[styles.libraryDetail, { color: colors.mutedForeground }]}>
-              Suggestions use capture time, photo dimensions, favourites and local file size — not visual AI.
+              Every check runs on this device, including blank and blurry detection. Photos are never uploaded.
             </Text>
           </View>
           <Feather name="check" size={16} color={colors.primary} />
@@ -174,6 +199,11 @@ const styles = StyleSheet.create({
   sectionHeading: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 29, marginBottom: 11 },
   sectionTitle: { fontSize: 16, letterSpacing: -0.3, fontFamily: 'Inter_600SemiBold' },
   sectionNote: { fontSize: 9, letterSpacing: 1.1, fontFamily: 'Inter_600SemiBold' },
+  tileGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 10 },
+  tile: { width: '48%', borderWidth: 1, borderRadius: 18, padding: 13, minHeight: 128 },
+  tileIcon: { width: 34, height: 34, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  tileTitle: { fontSize: 12, fontFamily: 'Inter_600SemiBold', marginTop: 14 },
+  tileDetail: { fontSize: 10, lineHeight: 14, fontFamily: 'Inter_400Regular', marginTop: 4 },
   libraryCard: { borderWidth: 1, borderRadius: 18, minHeight: 77, padding: 13, flexDirection: 'row', alignItems: 'center', gap: 11 },
   libraryIcon: { width: 37, height: 37, borderRadius: 13, alignItems: 'center', justifyContent: 'center' },
   libraryCopy: { flex: 1 },

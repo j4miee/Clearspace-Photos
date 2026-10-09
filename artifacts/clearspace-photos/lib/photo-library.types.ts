@@ -14,3 +14,5 @@ export type PhotoMetadata = {
   isFavorite: boolean;
   fileSize: number | null;
 };
+
+export type MediaMetadata = PhotoMetadata & { isVideo: boolean };
