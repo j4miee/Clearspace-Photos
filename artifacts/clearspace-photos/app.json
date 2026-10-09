@@ -14,7 +14,17 @@
     "web": {
       "favicon": "./assets/images/icon.png"
     },
-    "plugins": ["expo-router"],
+    "plugins": [
+      "expo-router",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Clearspace needs photo access to group similar moments and help you organise your camera roll.",
+          "savePhotosPermission": false,
+          "granularPermissions": ["photo"]
+        }
+      ]
+    ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true

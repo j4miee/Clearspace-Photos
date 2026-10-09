@@ -1,7 +1,7 @@
 import { Feather } from '@expo/vector-icons';
 import { router } from 'expo-router';
-import React, { useState } from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
+import React from 'react';
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
 import { usePhotoLibrary } from '@/context/PhotoLibraryContext';
@@ -9,9 +9,7 @@ import { usePhotoLibrary } from '@/context/PhotoLibraryContext';
 export default function SettingsScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const { freedBytes } = usePhotoLibrary();
-  const [askBeforeDelete, setAskBeforeDelete] = useState(true);
-  const [smartSuggestions, setSmartSuggestions] = useState(true);
+  const { freedBytes, clearedPhotoCount, pendingRemovalIds } = usePhotoLibrary();
 
   return (
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
@@ -23,7 +21,14 @@ export default function SettingsScreen() {
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.header}>
-          <Pressable onPress={() => router.push('/')} style={({ pressed }) => [styles.iconButton, { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.7 : 1 }]}>
+          <Pressable
+            accessibilityLabel="Back to home"
+            onPress={() => router.push('/')}
+            style={({ pressed }) => [
+              styles.iconButton,
+              { backgroundColor: colors.card, borderColor: colors.border, opacity: pressed ? 0.7 : 1 },
+            ]}
+          >
             <Feather name="arrow-left" size={18} color={colors.foreground} />
           </Pressable>
           <Text style={[styles.title, { color: colors.foreground }]}>Settings</Text>
@@ -32,72 +37,91 @@ export default function SettingsScreen() {
 
         <View style={[styles.profileCard, { backgroundColor: colors.foreground }]}>
           <View style={[styles.profileMark, { backgroundColor: colors.accent }]}>
-            <Feather name="sun" size={19} color={colors.accentForeground} />
+            <Feather name="shield" size={19} color={colors.accentForeground} />
           </View>
           <View style={styles.profileCopy}>
             <Text style={[styles.profileTitle, { color: colors.card }]}>Private by default</Text>
-            <Text style={[styles.profileBody, { color: '#B5C0BD' }]}>Clearspace works on your device.</Text>
+            <Text style={[styles.profileBody, { color: colors.muted }]}>
+              Photo details and ranking stay on this device.
+            </Text>
           </View>
           <Feather name="check" size={18} color={colors.accent} />
         </View>
 
-        <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>REVIEW PREFERENCES</Text>
+        <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>HOW PICKS WORK</Text>
         <View style={[styles.settingGroup, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <SettingRow
-            icon="shield"
-            title="Ask before deleting"
-            detail="Keep a final moment to change your mind"
-            value={askBeforeDelete}
-            onValueChange={setAskBeforeDelete}
+          <InfoRow
+            icon="aperture"
+            title="On-device smart ranking"
+            detail="Uses favourites, resolution and local file size. It does not inspect visual sharpness."
             colors={colors}
           />
           <View style={[styles.divider, { backgroundColor: colors.border }]} />
-          <SettingRow
-            icon="aperture"
-            title="Smart suggestions"
-            detail="Use clarity, duplicates and size to sort"
-            value={smartSuggestions}
-            onValueChange={setSmartSuggestions}
+          <InfoRow
+            icon="clock"
+            title="Similar moments"
+            detail="Groups photos taken close together with similar dimensions. No images are uploaded."
+            colors={colors}
+          />
+          <View style={[styles.divider, { backgroundColor: colors.border }]} />
+          <InfoRow
+            icon="check-circle"
+            title="Deletion always needs confirmation"
+            detail="A swipe only marks a photo. You review the selection before the phone's delete prompt."
             colors={colors}
           />
         </View>
 
         <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>YOUR PROGRESS</Text>
         <View style={[styles.progressCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <View style={[styles.progressIcon, { backgroundColor: `${colors.primary}16` }]}>
-            <Feather name="archive" size={19} color={colors.primary} />
+          <View style={[styles.progressIcon, { backgroundColor: colors.secondary }]}>
+            <Feather name="archive" size={19} color={colors.secondaryForeground} />
           </View>
           <View style={styles.progressCopy}>
-            <Text style={[styles.progressTitle, { color: colors.foreground }]}>{freedBytes ? `${Math.max(1, Math.round(freedBytes / 1000000))} MB` : '0 MB'} cleared</Text>
-            <Text style={[styles.progressBody, { color: colors.mutedForeground }]}>Every good decision adds up.</Text>
+            <Text style={[styles.progressTitle, { color: colors.foreground }]}>
+              {clearedPhotoCount} {clearedPhotoCount === 1 ? 'photo' : 'photos'} removed
+            </Text>
+            <Text style={[styles.progressBody, { color: colors.mutedForeground }]}>
+              {freedBytes > 0 ? `About ${(freedBytes / 1_000_000).toFixed(1)} MB of local files` : 'No file-size estimate available'}
+            </Text>
           </View>
-          <Feather name="chevron-right" size={18} color={colors.mutedForeground} />
         </View>
+
+        {pendingRemovalIds.length > 0 ? (
+          <Pressable
+            onPress={() => router.push('/library')}
+            style={[styles.pendingCard, { backgroundColor: colors.card, borderColor: colors.border }]}
+          >
+            <Feather name="trash-2" size={16} color={colors.primary} />
+            <Text style={[styles.pendingText, { color: colors.foreground }]}>
+              {pendingRemovalIds.length} photo{pendingRemovalIds.length === 1 ? '' : 's'} waiting for your review
+            </Text>
+            <Feather name="chevron-right" size={16} color={colors.mutedForeground} />
+          </Pressable>
+        ) : null}
 
         <Text style={[styles.sectionLabel, { color: colors.mutedForeground }]}>ABOUT</Text>
         <View style={[styles.aboutCard, { backgroundColor: colors.card, borderColor: colors.border }]}>
           <Text style={[styles.aboutTitle, { color: colors.foreground }]}>Clearspace</Text>
-          <Text style={[styles.aboutBody, { color: colors.mutedForeground }]}>Make space for what’s worth keeping.</Text>
-          <Text style={[styles.version, { color: colors.mutedForeground }]}>Version 1.0 · Made with care</Text>
+          <Text style={[styles.aboutBody, { color: colors.mutedForeground }]}>
+            Make space for what’s worth keeping.
+          </Text>
+          <Text style={[styles.version, { color: colors.mutedForeground }]}>Version 1.0</Text>
         </View>
       </ScrollView>
     </View>
   );
 }
 
-function SettingRow({
+function InfoRow({
   icon,
   title,
   detail,
-  value,
-  onValueChange,
   colors,
 }: {
   icon: keyof typeof Feather.glyphMap;
   title: string;
   detail: string;
-  value: boolean;
-  onValueChange: (value: boolean) => void;
   colors: ReturnType<typeof useColors>;
 }) {
   return (
@@ -109,7 +133,6 @@ function SettingRow({
         <Text style={[styles.settingTitle, { color: colors.foreground }]}>{title}</Text>
         <Text style={[styles.settingDetail, { color: colors.mutedForeground }]}>{detail}</Text>
       </View>
-      <Switch value={value} onValueChange={onValueChange} trackColor={{ false: colors.muted, true: colors.primary }} thumbColor={colors.card} />
     </View>
   );
 }
@@ -127,17 +150,19 @@ const styles = StyleSheet.create({
   profileBody: { fontSize: 11, fontFamily: 'Inter_400Regular', marginTop: 4 },
   sectionLabel: { fontSize: 10, letterSpacing: 1.4, fontFamily: 'Inter_600SemiBold', marginBottom: 10, marginTop: 2 },
   settingGroup: { borderWidth: 1, borderRadius: 18, overflow: 'hidden', marginBottom: 27 },
-  settingRow: { minHeight: 78, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 13 },
+  settingRow: { minHeight: 77, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 13, paddingVertical: 12 },
   settingIcon: { width: 37, height: 37, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
-  settingCopy: { flex: 1, marginLeft: 11, paddingRight: 8 },
+  settingCopy: { flex: 1, marginLeft: 11, paddingRight: 3 },
   settingTitle: { fontSize: 13, fontFamily: 'Inter_600SemiBold' },
-  settingDetail: { fontSize: 10, fontFamily: 'Inter_400Regular', marginTop: 4 },
+  settingDetail: { fontSize: 10, lineHeight: 15, fontFamily: 'Inter_400Regular', marginTop: 4 },
   divider: { height: 1, marginLeft: 61 },
-  progressCard: { minHeight: 78, borderWidth: 1, borderRadius: 18, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', marginBottom: 27 },
+  progressCard: { minHeight: 78, borderWidth: 1, borderRadius: 18, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
   progressIcon: { width: 37, height: 37, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
   progressCopy: { flex: 1, marginLeft: 11 },
   progressTitle: { fontSize: 13, fontFamily: 'Inter_600SemiBold' },
   progressBody: { fontSize: 10, fontFamily: 'Inter_400Regular', marginTop: 4 },
+  pendingCard: { minHeight: 54, borderWidth: 1, borderRadius: 15, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 9, marginBottom: 23 },
+  pendingText: { flex: 1, fontSize: 11, fontFamily: 'Inter_500Medium' },
   aboutCard: { borderWidth: 1, borderRadius: 18, padding: 16 },
   aboutTitle: { fontSize: 17, fontFamily: 'Inter_600SemiBold' },
   aboutBody: { fontSize: 12, fontFamily: 'Inter_400Regular', marginTop: 5 },

@@ -1,65 +1,125 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from 'react';
 
 type StoredState = {
-  selectedIds: string[];
+  pendingRemovalIds: string[];
+  keptIds: string[];
   freedBytes: number;
+  clearedPhotoCount: number;
 };
 
-type PhotoLibraryContextValue = {
-  selectedIds: string[];
-  freedBytes: number;
-  toggleSelection: (id: string) => void;
-  removeSelected: () => Promise<void>;
+type PhotoLibraryContextValue = StoredState & {
+  ready: boolean;
+  scannedPhotoCount: number;
+  similarGroupCount: number;
+  markForRemoval: (id: string) => void;
+  keepPhoto: (id: string) => void;
+  recordDeleted: (ids: string[], bytes: number) => Promise<void>;
+  setScanSummary: (photoCount: number, groupCount: number) => void;
 };
 
-const STORAGE_KEY = 'clearspace-library-state';
+const STORAGE_KEY = 'clearspace-library-state-v2';
+const EMPTY_STATE: StoredState = {
+  pendingRemovalIds: [],
+  keptIds: [],
+  freedBytes: 0,
+  clearedPhotoCount: 0,
+};
 const PhotoLibraryContext = createContext<PhotoLibraryContextValue | null>(null);
 
 export function PhotoLibraryProvider({ children }: { children: React.ReactNode }) {
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  const [freedBytes, setFreedBytes] = useState(0);
+  const [stored, setStored] = useState<StoredState>(EMPTY_STATE);
+  const [ready, setReady] = useState(false);
+  const [scannedPhotoCount, setScannedPhotoCount] = useState(0);
+  const [similarGroupCount, setSimilarGroupCount] = useState(0);
 
   useEffect(() => {
-    AsyncStorage.getItem(STORAGE_KEY).then((value) => {
-      if (!value) return;
-      try {
-        const parsed = JSON.parse(value) as StoredState;
-        setSelectedIds(parsed.selectedIds ?? []);
-        setFreedBytes(parsed.freedBytes ?? 0);
-      } catch {
-        // Ignore an unreadable local cache and start with a clean review state.
-      }
-    });
+    let active = true;
+    AsyncStorage.getItem(STORAGE_KEY)
+      .then((value) => {
+        if (!active || !value) return;
+        try {
+          const parsed = JSON.parse(value) as Partial<StoredState>;
+          setStored({
+            pendingRemovalIds: parsed.pendingRemovalIds ?? [],
+            keptIds: parsed.keptIds ?? [],
+            freedBytes: parsed.freedBytes ?? 0,
+            clearedPhotoCount: parsed.clearedPhotoCount ?? 0,
+          });
+        } catch {
+          // Start clean if a prior local state cannot be read.
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (active) setReady(true);
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
-  const persist = (nextIds: string[], nextFreed: number) => {
-    return AsyncStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({ selectedIds: nextIds, freedBytes: nextFreed }),
-    );
+  const persist = (next: StoredState) => {
+    setStored(next);
+    void AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next)).catch(() => undefined);
   };
 
-  const toggleSelection = (id: string) => {
-    setSelectedIds((current) => {
-      const next = current.includes(id)
-        ? current.filter((item) => item !== id)
-        : [...current, id];
-      void persist(next, freedBytes);
-      return next;
-    });
+  const markForRemoval = (id: string) => {
+    const next: StoredState = {
+      ...stored,
+      pendingRemovalIds: stored.pendingRemovalIds.includes(id)
+        ? stored.pendingRemovalIds
+        : [...stored.pendingRemovalIds, id],
+      keptIds: stored.keptIds.filter((keptId) => keptId !== id),
+    };
+    persist(next);
   };
 
-  const removeSelected = async () => {
-    const nextFreed = freedBytes + selectedIds.length * 24500000;
-    setSelectedIds([]);
-    setFreedBytes(nextFreed);
-    await persist([], nextFreed);
+  const keepPhoto = (id: string) => {
+    const next: StoredState = {
+      ...stored,
+      pendingRemovalIds: stored.pendingRemovalIds.filter((pendingId) => pendingId !== id),
+      keptIds: stored.keptIds.includes(id) ? stored.keptIds : [...stored.keptIds, id],
+    };
+    persist(next);
+  };
+
+  const recordDeleted = async (ids: string[], bytes: number) => {
+    const deleted = new Set(ids);
+    const next: StoredState = {
+      ...stored,
+      pendingRemovalIds: stored.pendingRemovalIds.filter((id) => !deleted.has(id)),
+      keptIds: stored.keptIds.filter((id) => !deleted.has(id)),
+      freedBytes: stored.freedBytes + bytes,
+      clearedPhotoCount: stored.clearedPhotoCount + ids.length,
+    };
+    setStored(next);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  };
+
+  const setScanSummary = (photoCount: number, groupCount: number) => {
+    setScannedPhotoCount(photoCount);
+    setSimilarGroupCount(groupCount);
   };
 
   const value = useMemo(
-    () => ({ selectedIds, freedBytes, toggleSelection, removeSelected }),
-    [selectedIds, freedBytes],
+    () => ({
+      ...stored,
+      ready,
+      scannedPhotoCount,
+      similarGroupCount,
+      markForRemoval,
+      keepPhoto,
+      recordDeleted,
+      setScanSummary,
+    }),
+    [stored, ready, scannedPhotoCount, similarGroupCount],
   );
 
   return <PhotoLibraryContext.Provider value={value}>{children}</PhotoLibraryContext.Provider>;

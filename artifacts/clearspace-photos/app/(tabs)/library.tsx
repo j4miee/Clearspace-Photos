@@ -1,9 +1,13 @@
 import { Feather } from '@expo/vector-icons';
-import { router, useLocalSearchParams } from 'expo-router';
+import { router } from 'expo-router';
 import * as Haptics from 'expo-haptics';
-import React, { useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Alert,
+  Animated,
   Image,
+  Linking,
+  PanResponder,
   Platform,
   Pressable,
   ScrollView,
@@ -14,45 +18,408 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
 import { usePhotoLibrary } from '@/context/PhotoLibraryContext';
+import * as PhotoLibrary from '@/lib/photo-library';
+import type { PhotoMetadata, PhotoPermission } from '@/lib/photo-library.types';
 
-const coast = require('../../assets/images/photo-coast.png');
-const table = require('../../assets/images/photo-table.png');
-const meadow = require('../../assets/images/photo-meadow.png');
+type RankedPhoto = PhotoMetadata;
+type SimilarGroup = { id: string; photos: RankedPhoto[] };
+type SwipeDecision = 'keep' | 'remove';
 
-type PhotoItem = { id: string; title: string; size: string; image: number; reason: string };
-const photos: PhotoItem[] = [
-  { id: 'coast-1', title: 'Coast, 14:32', size: '24.6 MB', image: coast, reason: 'Near-identical' },
-  { id: 'coast-2', title: 'Coast, 14:31', size: '24.1 MB', image: coast, reason: 'Near-identical' },
-  { id: 'table-1', title: 'At home, 09:18', size: '18.2 MB', image: table, reason: 'Near-identical' },
-  { id: 'meadow-1', title: 'Meadow, Sunday', size: '22.8 MB', image: meadow, reason: 'Near-identical' },
-];
+const PAGE_SIZE = 240;
+const BURST_WINDOW_MS = 90_000;
+const MAX_GROUP_SPAN_MS = 180_000;
+const ASPECT_RATIO_TOLERANCE = 0.12;
 
-const filters = ['Duplicates', 'Screenshots', 'Blurry', 'Videos'];
+function aspectRatio(photo: PhotoMetadata) {
+  if (!photo.width || !photo.height) return 0;
+  return Math.min(photo.width, photo.height) / Math.max(photo.width, photo.height);
+}
+
+function rankPhotos(photos: RankedPhoto[]) {
+  return [...photos].sort((a, b) => {
+    if (a.isFavorite !== b.isFavorite) return a.isFavorite ? -1 : 1;
+    const aPixels = (a.width ?? 0) * (a.height ?? 0);
+    const bPixels = (b.width ?? 0) * (b.height ?? 0);
+    if (aPixels !== bPixels) return bPixels - aPixels;
+    return (b.fileSize ?? 0) - (a.fileSize ?? 0);
+  });
+}
+
+function groupNearbyPhotos(
+  photos: RankedPhoto[],
+  pendingIds: string[],
+  keptIds: string[],
+): SimilarGroup[] {
+  const alreadyDecided = new Set([...pendingIds, ...keptIds]);
+  const candidates = photos
+    .filter((photo) => photo.creationTime != null && !alreadyDecided.has(photo.id))
+    .sort((a, b) => (a.creationTime ?? 0) - (b.creationTime ?? 0));
+  const groups: RankedPhoto[][] = [];
+  let current: RankedPhoto[] = [];
+
+  const finishGroup = () => {
+    if (current.length > 1) groups.push(current);
+    current = [];
+  };
+
+  for (const photo of candidates) {
+    const previous = current[current.length - 1];
+    if (!previous) {
+      current = [photo];
+      continue;
+    }
+    const elapsed = (photo.creationTime ?? 0) - (previous.creationTime ?? 0);
+    const groupSpan = (photo.creationTime ?? 0) - (current[0].creationTime ?? 0);
+    const ratioDelta = Math.abs(aspectRatio(photo) - aspectRatio(previous));
+    if (
+      elapsed <= BURST_WINDOW_MS &&
+      groupSpan <= MAX_GROUP_SPAN_MS &&
+      ratioDelta <= ASPECT_RATIO_TOLERANCE
+    ) {
+      current.push(photo);
+    } else {
+      finishGroup();
+      current = [photo];
+    }
+  }
+  finishGroup();
+
+  return groups
+    .map((group, index) => ({
+      id: `set-${index}-${group[0]?.id ?? 'unknown'}`,
+      photos: rankPhotos(group),
+    }))
+    .sort(
+      (a, b) =>
+        (b.photos[0]?.creationTime ?? 0) - (a.photos[0]?.creationTime ?? 0),
+    );
+}
+
+async function addLocalFileSizes(groups: SimilarGroup[]) {
+  const allPhotos = groups.flatMap((group) => group.photos);
+  const sizes = new Map<string, number | null>();
+
+  for (let index = 0; index < allPhotos.length; index += 8) {
+    const chunk = allPhotos.slice(index, index + 8);
+    await Promise.all(
+      chunk.map(async (photo) => {
+        try {
+          sizes.set(photo.id, await PhotoLibrary.getLocalPhotoFileSize(photo.id));
+        } catch {
+          sizes.set(photo.id, null);
+        }
+      }),
+    );
+  }
+
+  return groups.map((group) => ({
+    ...group,
+    photos: rankPhotos(
+      group.photos.map((photo) => ({
+        ...photo,
+        fileSize: sizes.get(photo.id) ?? null,
+      })),
+    ),
+  }));
+}
+
+function formatSize(bytes: number | null) {
+  if (!bytes || bytes <= 0) return 'Size unavailable';
+  if (bytes < 1_000_000) return `${Math.max(1, Math.round(bytes / 1000))} KB`;
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+function formatDate(timestamp: number | null) {
+  if (!timestamp) return 'Date unavailable';
+  return new Date(timestamp).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
+
+function formatMegapixels(photo: RankedPhoto) {
+  const pixels = (photo.width ?? 0) * (photo.height ?? 0);
+  return pixels > 0 ? `${(pixels / 1_000_000).toFixed(1)} MP` : 'Resolution unavailable';
+}
 
 export default function LibraryScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
-  const params = useLocalSearchParams<{ filter?: string }>();
-  const [activeFilter, setActiveFilter] = useState(
-    typeof params.filter === 'string' ? params.filter : 'Duplicates',
-  );
-  const { selectedIds, removeSelected } = usePhotoLibrary();
-  const [removedMessage, setRemovedMessage] = useState(false);
+  const {
+    ready,
+    pendingRemovalIds,
+    keptIds,
+    markForRemoval,
+    keepPhoto,
+    recordDeleted,
+    setScanSummary,
+  } = usePhotoLibrary();
+  const [permission, setPermission] = useState<PhotoPermission | null>(null);
+  const [photos, setPhotos] = useState<RankedPhoto[]>([]);
+  const [groups, setGroups] = useState<SimilarGroup[]>([]);
+  const [groupIndex, setGroupIndex] = useState(0);
+  const [cardIndex, setCardIndex] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
+  const [hasScanned, setHasScanned] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [busyDeleting, setBusyDeleting] = useState(false);
+  const pan = useRef(new Animated.ValueXY()).current;
+  const decisionRef = useRef<(decision: SwipeDecision) => void>(() => undefined);
 
-  const visiblePhotos = useMemo(() => photos, []);
-  const remove = async () => {
-    if (!selectedIds.length) return;
-    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    await removeSelected();
-    setRemovedMessage(true);
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    let active = true;
+    PhotoLibrary.getPhotoPermission()
+      .then((result) => {
+        if (active) setPermission(result);
+      })
+      .catch(() => {
+        if (active) setPermission(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const scanPage = useCallback(
+    async (startOver: boolean) => {
+      if (Platform.OS === 'web') return;
+      const pageOffset = startOver ? 0 : offset;
+      const previous = startOver ? [] : photos;
+      setIsScanning(true);
+      setErrorMessage('');
+      setDeleteError('');
+      try {
+        const page = await PhotoLibrary.queryPhotoPage(pageOffset, PAGE_SIZE);
+        const combined = [
+          ...previous,
+          ...page
+            .filter((photo) => !previous.some((existing) => existing.id === photo.id))
+            .map((photo) => ({ ...photo, fileSize: null })),
+        ];
+        const rawGroups = groupNearbyPhotos(combined, pendingRemovalIds, keptIds);
+        const rankedGroups = await addLocalFileSizes(rawGroups);
+        setPhotos(combined);
+        setGroups(rankedGroups);
+        setGroupIndex(0);
+        setCardIndex(0);
+        setOffset(pageOffset + page.length);
+        setHasMore(page.length === PAGE_SIZE);
+        setHasScanned(true);
+        setScanSummary(combined.length, rankedGroups.length);
+      } catch (error) {
+        setErrorMessage(
+          error instanceof Error
+            ? error.message
+            : 'Clearspace could not read the photo library. Try again.',
+        );
+      } finally {
+        setIsScanning(false);
+      }
+    },
+    [offset, photos, pendingRemovalIds, keptIds, setScanSummary],
+  );
+
+  const requestAccessAndScan = async () => {
+    if (Platform.OS === 'web') return;
+    setErrorMessage('');
+    try {
+      const result = await PhotoLibrary.requestPhotoAccess();
+      setPermission(result);
+      if (result.granted) await scanPage(true);
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Photo access could not be requested.',
+      );
+    }
   };
+
+  const activeGroup = groups[groupIndex];
+  const currentPhoto = activeGroup?.photos[cardIndex];
+  const nextPhoto =
+    activeGroup?.photos[cardIndex + 1] ?? groups[groupIndex + 1]?.photos[0];
+  const completed = hasScanned && !isScanning && !currentPhoto;
+  const advance = (decision: SwipeDecision) => {
+    if (!currentPhoto || !activeGroup) return;
+    if (decision === 'remove') {
+      const alreadyKeptInSet = activeGroup.photos.some((photo) =>
+        keptIds.includes(photo.id),
+      );
+      const unreviewedAlternative = activeGroup.photos
+        .slice(cardIndex + 1)
+        .some((photo) => !pendingRemovalIds.includes(photo.id));
+      if (!alreadyKeptInSet && !unreviewedAlternative) {
+        Alert.alert(
+          'Keep one photo from this set',
+          'Clearspace will not mark the final photo in a set for removal. Keep it, or go back to choose another photo.',
+          [{ text: 'Got it' }],
+        );
+        return;
+      }
+      markForRemoval(currentPhoto.id);
+      setNotice('Marked for removal. Nothing is deleted until you confirm.');
+    } else {
+      keepPhoto(currentPhoto.id);
+      setNotice('Kept in this set.');
+    }
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    if (cardIndex + 1 < activeGroup.photos.length) {
+      setCardIndex(cardIndex + 1);
+    } else {
+      setGroupIndex(groupIndex + 1);
+      setCardIndex(0);
+    }
+  };
+  decisionRef.current = advance;
+
+  const animateDecision = (decision: SwipeDecision) => {
+    Animated.timing(pan, {
+      toValue: { x: decision === 'keep' ? 480 : -480, y: 0 },
+      duration: 190,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) {
+        pan.setValue({ x: 0, y: 0 });
+        decisionRef.current(decision);
+      }
+    });
+  };
+
+  const responder = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => false,
+        onMoveShouldSetPanResponder: (_, gesture) =>
+          Math.abs(gesture.dx) > 8 && Math.abs(gesture.dx) > Math.abs(gesture.dy),
+        onPanResponderMove: Animated.event([null, { dx: pan.x, dy: pan.y }], {
+          useNativeDriver: false,
+        }),
+        onPanResponderRelease: (_, gesture) => {
+          if (gesture.dx > 105) {
+            animateDecision('keep');
+          } else if (gesture.dx < -105) {
+            animateDecision('remove');
+          } else {
+            Animated.spring(pan, {
+              toValue: { x: 0, y: 0 },
+              useNativeDriver: true,
+              friction: 7,
+            }).start();
+          }
+        },
+      }),
+    [pan],
+  );
+
+  const removeMarked = () => {
+    if (Platform.OS === 'web' || pendingRemovalIds.length === 0 || busyDeleting) return;
+    const ids = [...pendingRemovalIds];
+    const knownBytes = photos
+      .filter((photo) => ids.includes(photo.id))
+      .reduce((total, photo) => total + (photo.fileSize ?? 0), 0);
+
+    Alert.alert(
+      `Remove ${ids.length} ${ids.length === 1 ? 'photo' : 'photos'}?`,
+      'Your phone will ask you to confirm the deletion. This cannot be undone from Clearspace.',
+      [
+        { text: 'Keep reviewing', style: 'cancel' },
+        {
+          text: 'Continue',
+          style: 'destructive',
+          onPress: async () => {
+            setBusyDeleting(true);
+            setDeleteError('');
+            try {
+              await PhotoLibrary.deletePhotos(ids);
+            } catch (error) {
+              setDeleteError(
+                error instanceof Error
+                  ? error.message
+                  : 'The phone did not approve deletion. Your photos are unchanged.',
+              );
+              setBusyDeleting(false);
+              return;
+            }
+
+            const removed = new Set(ids);
+            const nextGroups = groups
+              .map((group) => ({
+                ...group,
+                photos: group.photos.filter(
+                  (photo) =>
+                    !removed.has(photo.id) &&
+                    !pendingRemovalIds.includes(photo.id) &&
+                    !keptIds.includes(photo.id),
+                ),
+              }))
+              .filter((group) => group.photos.length > 1);
+            try {
+              await recordDeleted(ids, knownBytes);
+            } catch {
+              setDeleteError('The photos were removed, but Clearspace could not save the local progress count.');
+            }
+            try {
+              setPhotos((current) => current.filter((photo) => !removed.has(photo.id)));
+              setGroups(nextGroups);
+              setGroupIndex(0);
+              setCardIndex(0);
+              setScanSummary(Math.max(0, photos.length - ids.length), nextGroups.length);
+              setNotice('Photos removed from your library.');
+            } finally {
+              setBusyDeleting(false);
+            }
+          },
+        },
+      ],
+    );
+  };
+
+  const openSettings = async () => {
+    if (Platform.OS === 'web') return;
+    try {
+      await Linking.openSettings();
+    } catch {
+      setErrorMessage('Open your device settings to allow photo access.');
+    }
+  };
+
+  const manageLimitedAccess = async () => {
+    try {
+      await PhotoLibrary.presentLimitedPhotoPicker();
+      const result = await PhotoLibrary.getPhotoPermission();
+      setPermission(result);
+    } catch {
+      setErrorMessage('Photo access settings could not be opened.');
+    }
+  };
+
+  const rotation = pan.x.interpolate({
+    inputRange: [-240, 240],
+    outputRange: ['-14deg', '14deg'],
+    extrapolate: 'clamp',
+  });
+  const keepOpacity = pan.x.interpolate({
+    inputRange: [0, 70, 180],
+    outputRange: [0, 0.55, 1],
+    extrapolate: 'clamp',
+  });
+  const removeOpacity = pan.x.interpolate({
+    inputRange: [-180, -70, 0],
+    outputRange: [1, 0.55, 0],
+    extrapolate: 'clamp',
+  });
 
   return (
     <View style={[styles.screen, { backgroundColor: colors.background }]}>
       <ScrollView
         contentContainerStyle={[
           styles.content,
-          { paddingTop: insets.top + 17, paddingBottom: Platform.OS === 'web' ? 112 : 110 },
+          { paddingTop: insets.top + 16, paddingBottom: Platform.OS === 'web' ? 112 : 116 },
         ]}
         showsVerticalScrollIndicator={false}
       >
@@ -61,127 +428,302 @@ export default function LibraryScreen() {
             testID="library-back"
             accessibilityLabel="Back to home"
             onPress={() => router.push('/')}
-            style={({ pressed }) => [styles.backButton, { borderColor: colors.border, backgroundColor: colors.card, opacity: pressed ? 0.7 : 1 }]}
+            style={({ pressed }) => [
+              styles.backButton,
+              { borderColor: colors.border, backgroundColor: colors.card, opacity: pressed ? 0.7 : 1 },
+            ]}
           >
             <Feather name="arrow-left" size={18} color={colors.foreground} />
           </Pressable>
           <View style={styles.headerCopy}>
-            <Text style={[styles.eyebrow, { color: colors.mutedForeground }]}>LIBRARY REVIEW</Text>
-            <Text style={[styles.title, { color: colors.foreground }]}>Make some room</Text>
+            <Text style={[styles.eyebrow, { color: colors.mutedForeground }]}>ON-DEVICE REVIEW</Text>
+            <Text style={[styles.title, { color: colors.foreground }]}>Similar moments</Text>
           </View>
           <View style={{ width: 42 }} />
         </View>
 
-        <Text style={[styles.intro, { color: colors.mutedForeground }]}>
-          Keep the best version. Clear the rest in a few taps.
-        </Text>
+        {Platform.OS === 'web' ? (
+          <EmptyPanel
+            icon="smartphone"
+            title="Open Clearspace on your phone"
+            body="Photo libraries are available in the native app. Your photos are never uploaded."
+            colors={colors}
+          />
+        ) : !ready || permission === null ? (
+          <EmptyPanel
+            icon="image"
+            title="Checking photo access"
+            body="Your library is only read after you allow access."
+            colors={colors}
+            loading
+          />
+        ) : !permission.granted ? (
+          <EmptyPanel
+            icon="image"
+            title="Start with your camera roll"
+            body="Clearspace reads your photos on this device to group quick bursts and suggest which version has the most detail. Nothing leaves your phone."
+            colors={colors}
+            actionLabel={
+              permission.status === 'denied' && !permission.canAskAgain
+                ? 'Open device settings'
+                : 'Allow photo access'
+            }
+            onAction={
+              permission.status === 'denied' && !permission.canAskAgain
+                ? openSettings
+                : requestAccessAndScan
+            }
+          />
+        ) : !hasScanned && !isScanning ? (
+          <EmptyPanel
+            icon="aperture"
+            title="A careful first scan"
+            body="We’ll look at up to 240 recent photos at a time. Groups are based on capture time and similar dimensions, then ranked on-device by favourites, resolution and file size."
+            colors={colors}
+            actionLabel="Scan my photos"
+            onAction={() => void scanPage(true)}
+          />
+        ) : isScanning ? (
+          <EmptyPanel
+            icon="aperture"
+            title="Looking for similar moments"
+            body="Reading photo details and comparing capture times on this device."
+            colors={colors}
+            loading
+          />
+        ) : currentPhoto && activeGroup ? (
+          <>
+            <Text style={[styles.intro, { color: colors.mutedForeground }]}>
+              Swipe right to keep · left to mark for removal
+            </Text>
+            <View style={styles.groupMeta}>
+              <View>
+                <Text style={[styles.groupTitle, { color: colors.foreground }]}>
+                  Set {groupIndex + 1} of {groups.length}
+                </Text>
+                <Text style={[styles.groupCaption, { color: colors.mutedForeground }]}>
+                  {activeGroup.photos.length} photos · {formatDate(activeGroup.photos[0]?.creationTime ?? null)}
+                </Text>
+              </View>
+              <View style={[styles.localTag, { backgroundColor: `${colors.accent}40` }]}>
+                <Feather name="smartphone" size={13} color={colors.accentForeground} />
+                <Text style={[styles.localTagText, { color: colors.accentForeground }]}>On device</Text>
+              </View>
+            </View>
 
-        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
-          {filters.map((filter) => {
-            const active = activeFilter === filter;
-            return (
-              <Pressable
-                key={filter}
-                testID={`filter-${filter}`}
-                onPress={() => setActiveFilter(filter)}
-                style={({ pressed }) => [
-                  styles.filterPill,
-                  { backgroundColor: active ? colors.foreground : colors.card, borderColor: active ? colors.foreground : colors.border, opacity: pressed ? 0.72 : 1 },
+            <View style={styles.cardArea}>
+              {groups[groupIndex + 1]?.photos[0] ? (
+                <View style={[styles.stackCard, styles.stackCardBack, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                  <Image source={{ uri: groups[groupIndex + 1].photos[0]?.id }} style={styles.cardImage} />
+                </View>
+              ) : null}
+              {nextPhoto ? (
+                <View style={[styles.stackCard, styles.stackCardMiddle, { backgroundColor: colors.card, borderColor: colors.border }]}>
+                  <Image source={{ uri: nextPhoto.id }} style={styles.cardImage} />
+                </View>
+              ) : null}
+              <Animated.View
+                testID="swipe-photo-card"
+                {...responder.panHandlers}
+                style={[
+                  styles.stackCard,
+                  styles.frontCard,
+                  { backgroundColor: colors.card, borderColor: colors.border },
+                  { transform: [{ translateX: pan.x }, { translateY: pan.y }, { rotate: rotation }] },
                 ]}
               >
-                <Text style={[styles.filterText, { color: active ? colors.card : colors.mutedForeground }]}>{filter}</Text>
-              </Pressable>
-            );
-          })}
-        </ScrollView>
+                <Image source={{ uri: currentPhoto.id }} style={styles.cardImage} />
+                <View style={styles.imageScrim} />
+                {cardIndex === 0 ? (
+                  <View style={[styles.recommendedTag, { backgroundColor: colors.accent }]}>
+                    <Feather name={currentPhoto.isFavorite ? 'heart' : 'star'} size={13} color={colors.accentForeground} />
+                    <Text style={[styles.recommendedText, { color: colors.accentForeground }]}>
+                      {currentPhoto.isFavorite ? 'Your favourite' : 'Suggested best'}
+                    </Text>
+                  </View>
+                ) : null}
+                <Animated.View style={[styles.swipeStamp, styles.keepStamp, { borderColor: colors.secondary, opacity: keepOpacity }]}>
+                  <Text style={[styles.stampText, { color: colors.secondary }]}>KEEP</Text>
+                </Animated.View>
+                <Animated.View style={[styles.swipeStamp, styles.removeStamp, { borderColor: colors.primaryForeground, opacity: removeOpacity }]}>
+                  <Text style={[styles.stampText, { color: colors.primaryForeground }]}>REMOVE</Text>
+                </Animated.View>
+                <View style={styles.photoOverlay}>
+                  <Text style={[styles.photoName, { color: colors.card }]} numberOfLines={1}>
+                    {currentPhoto.filename ?? 'Photo'}
+                  </Text>
+                  <Text style={[styles.photoDetails, { color: colors.card }]}>
+                    {formatMegapixels(currentPhoto)} · {formatSize(currentPhoto.fileSize)}
+                  </Text>
+                </View>
+              </Animated.View>
+            </View>
 
-        {removedMessage ? (
-          <View style={[styles.successBanner, { backgroundColor: colors.secondary }]}>
-            <Feather name="check-circle" size={17} color={colors.primary} />
-            <Text style={[styles.successText, { color: colors.secondaryForeground }]}>Nice. Those photos are out of your way.</Text>
-            <Pressable onPress={() => setRemovedMessage(false)}><Feather name="x" size={16} color={colors.mutedForeground} /></Pressable>
+            <Text style={[styles.recommendationReason, { color: colors.mutedForeground }]}>
+              {currentPhoto.isFavorite
+                ? 'Already in Favourites — Clearspace will never auto-mark it for removal.'
+                : cardIndex === 0
+                  ? 'Suggested by resolution and local file size. This is not a visual sharpness test.'
+                  : 'Compare this photo with the suggested version before deciding.'}
+            </Text>
+
+            <View style={styles.decisionRow}>
+              <Pressable
+                testID="mark-photo-for-removal"
+                accessibilityLabel="Mark photo for removal"
+                onPress={() => animateDecision('remove')}
+                style={({ pressed }) => [
+                  styles.decisionButton,
+                  styles.removeDecision,
+                  { borderColor: colors.border, backgroundColor: colors.card, opacity: pressed ? 0.72 : 1 },
+                ]}
+              >
+                <Feather name="x" size={20} color={colors.primary} />
+              </Pressable>
+              <Text style={[styles.decisionHint, { color: colors.mutedForeground }]}>
+                {cardIndex + 1} / {activeGroup.photos.length}
+              </Text>
+              <Pressable
+                testID="keep-photo"
+                accessibilityLabel="Keep photo"
+                onPress={() => animateDecision('keep')}
+                style={({ pressed }) => [
+                  styles.decisionButton,
+                  styles.keepDecision,
+                  { backgroundColor: colors.foreground, opacity: pressed ? 0.72 : 1 },
+                ]}
+              >
+                <Feather name="check" size={20} color={colors.card} />
+              </Pressable>
+            </View>
+          </>
+        ) : completed ? (
+          <EmptyPanel
+            icon="check-circle"
+            title={groups.length ? 'That set is reviewed' : 'No quick-burst sets found'}
+            body={
+              groups.length
+                ? 'Your keep choices are saved on this device. Photos marked for removal are still in your library until you confirm.'
+                : 'We group photos captured close together with similar dimensions. Try scanning older photos, or come back after taking a burst.'
+            }
+            colors={colors}
+            actionLabel={hasMore ? 'Scan older photos' : 'Scan again'}
+            onAction={() => void scanPage(!hasMore)}
+          />
+        ) : null}
+
+        {permission?.granted && permission.accessPrivileges === 'limited' && Platform.OS !== 'web' ? (
+          <Pressable
+            testID="manage-limited-access"
+            onPress={() => void manageLimitedAccess()}
+            style={[styles.manageAccess, { borderColor: colors.border }]}
+          >
+            <Feather name="image" size={14} color={colors.primary} />
+            <Text style={[styles.manageAccessText, { color: colors.primary }]}>Manage selected photos</Text>
+          </Pressable>
+        ) : null}
+
+        {permission?.granted && hasScanned ? (
+          <Pressable
+            testID="rescan-library"
+            onPress={() => void scanPage(true)}
+            disabled={isScanning}
+            style={styles.rescanButton}
+          >
+            <Feather name="refresh-cw" size={13} color={colors.mutedForeground} />
+            <Text style={[styles.rescanText, { color: colors.mutedForeground }]}>Rescan recent photos</Text>
+          </Pressable>
+        ) : null}
+
+        {notice ? (
+          <View style={[styles.notice, { backgroundColor: colors.secondary }]}>
+            <Feather name="check-circle" size={15} color={colors.primary} />
+            <Text style={[styles.noticeText, { color: colors.secondaryForeground }]}>{notice}</Text>
+          </View>
+        ) : null}
+        {errorMessage ? (
+          <View style={[styles.errorBox, { backgroundColor: `${colors.destructive}12` }]}>
+            <Text style={[styles.errorText, { color: colors.destructive }]}>{errorMessage}</Text>
+            <Pressable onPress={requestAccessAndScan} style={styles.retryButton}>
+              <Text style={[styles.retryText, { color: colors.destructive }]}>Try again</Text>
+            </Pressable>
+          </View>
+        ) : null}
+        {deleteError ? (
+          <View style={[styles.errorBox, { backgroundColor: `${colors.destructive}12` }]}>
+            <Text style={[styles.errorText, { color: colors.destructive }]}>{deleteError}</Text>
           </View>
         ) : null}
 
-        <View style={styles.reviewHeading}>
-          <View>
-            <Text style={[styles.reviewTitle, { color: colors.foreground }]}>{activeFilter}</Text>
-            <Text style={[styles.reviewCaption, { color: colors.mutedForeground }]}>4 items · 89.7 MB to review</Text>
+        {pendingRemovalIds.length > 0 ? (
+          <View style={[styles.pendingPanel, { backgroundColor: colors.card, borderColor: colors.border }]}>
+            <View style={styles.pendingCopy}>
+              <Text style={[styles.pendingTitle, { color: colors.foreground }]}>
+                {pendingRemovalIds.length} marked for removal
+              </Text>
+              <Text style={[styles.pendingSubcopy, { color: colors.mutedForeground }]}>
+                Not deleted yet. Review and confirm when ready.
+              </Text>
+            </View>
+            <Pressable
+              testID="remove-marked-photos"
+              disabled={busyDeleting || Platform.OS === 'web'}
+              onPress={removeMarked}
+              style={({ pressed }) => [
+                styles.removeMarkedButton,
+                { backgroundColor: colors.primary, opacity: pressed || busyDeleting ? 0.72 : 1 },
+              ]}
+            >
+              <Feather name={busyDeleting ? 'loader' : 'trash-2'} size={15} color={colors.primaryForeground} />
+              <Text style={[styles.removeMarkedText, { color: colors.primaryForeground }]}>
+                {busyDeleting ? 'Waiting…' : 'Review delete'}
+              </Text>
+            </Pressable>
           </View>
-          <View style={[styles.aiTag, { backgroundColor: `${colors.accent}30` }]}>
-            <Feather name="aperture" size={13} color={colors.accentForeground} />
-            <Text style={[styles.aiTagText, { color: colors.accentForeground }]}>Smart pick</Text>
-          </View>
-        </View>
-
-        <View style={styles.photoGrid}>
-          {visiblePhotos.map((photo) => (
-            <PhotoCard key={photo.id} photo={photo} selected={selectedIds.includes(photo.id)} colors={colors} />
-          ))}
-        </View>
-
-        <View style={[styles.keepNote, { backgroundColor: colors.card, borderColor: colors.border }]}>
-          <Feather name="check" size={15} color={colors.primary} />
-          <Text style={[styles.keepNoteText, { color: colors.mutedForeground }]}>
-            The clearest photo in each group stays automatically.
-          </Text>
-        </View>
+        ) : null}
       </ScrollView>
-
-      <View style={[styles.bottomBar, { backgroundColor: colors.card, borderColor: colors.border, paddingBottom: Platform.OS === 'web' ? 20 : insets.bottom + 10 }]}>
-        <Text style={[styles.selectionText, { color: colors.foreground }]}>
-          {selectedIds.length ? `${selectedIds.length} selected` : 'Tap photos to select'}
-        </Text>
-        <Pressable
-          testID="remove-selected"
-          disabled={!selectedIds.length}
-          onPress={remove}
-          style={({ pressed }) => [
-            styles.removeButton,
-            { backgroundColor: selectedIds.length ? colors.primary : colors.muted, opacity: pressed ? 0.8 : 1 },
-          ]}
-        >
-          <Feather name="trash-2" size={16} color={selectedIds.length ? colors.primaryForeground : colors.mutedForeground} />
-          <Text style={[styles.removeText, { color: selectedIds.length ? colors.primaryForeground : colors.mutedForeground }]}>Remove</Text>
-        </Pressable>
-      </View>
     </View>
   );
 }
 
-function PhotoCard({
-  photo,
-  selected,
+function EmptyPanel({
+  icon,
+  title,
+  body,
   colors,
+  actionLabel,
+  onAction,
+  loading = false,
 }: {
-  photo: PhotoItem;
-  selected: boolean;
+  icon: keyof typeof Feather.glyphMap;
+  title: string;
+  body: string;
   colors: ReturnType<typeof useColors>;
+  actionLabel?: string;
+  onAction?: () => void;
+  loading?: boolean;
 }) {
-  const { toggleSelection } = usePhotoLibrary();
   return (
-    <Pressable
-      testID={`photo-${photo.id}`}
-      onPress={() => {
-        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-        toggleSelection(photo.id);
-      }}
-      style={({ pressed }) => [styles.photoCard, { backgroundColor: colors.card, borderColor: selected ? colors.primary : colors.border, borderWidth: selected ? 2 : 1, opacity: pressed ? 0.86 : 1 }]}
-    >
-      <View style={styles.photoFrame}>
-        <Image source={photo.image} style={styles.photoImage} />
-        <View style={[styles.photoCheck, { backgroundColor: selected ? colors.primary : `${colors.card}D9`, borderColor: selected ? colors.primary : colors.card }]}>
-          {selected ? <Feather name="check" size={13} color={colors.primaryForeground} /> : null}
-        </View>
-        <View style={[styles.reasonTag, { backgroundColor: `${colors.foreground}CC` }]}>
-          <Text style={[styles.reasonText, { color: colors.card }]}>{photo.reason}</Text>
-        </View>
+    <View style={[styles.emptyPanel, { backgroundColor: colors.card, borderColor: colors.border }]}>
+      <View style={[styles.emptyIcon, { backgroundColor: colors.secondary }]}>
+        <Feather name={loading ? 'loader' : icon} size={21} color={colors.secondaryForeground} />
       </View>
-      <View style={styles.photoMeta}>
-        <Text style={[styles.photoTitle, { color: colors.foreground }]} numberOfLines={1}>{photo.title}</Text>
-        <Text style={[styles.photoSize, { color: colors.mutedForeground }]}>{photo.size}</Text>
-      </View>
-    </Pressable>
+      <Text style={[styles.emptyTitle, { color: colors.foreground }]}>{title}</Text>
+      <Text style={[styles.emptyBody, { color: colors.mutedForeground }]}>{body}</Text>
+      {actionLabel && onAction ? (
+        <Pressable
+          testID="photo-library-action"
+          onPress={onAction}
+          style={({ pressed }) => [
+            styles.scanButton,
+            { backgroundColor: colors.foreground, opacity: pressed ? 0.8 : 1 },
+          ]}
+        >
+          <Text style={[styles.scanButtonText, { color: colors.card }]}>{actionLabel}</Text>
+          <Feather name="arrow-right" size={16} color={colors.card} />
+        </Pressable>
+      ) : null}
+    </View>
   );
 }
 
@@ -192,32 +734,55 @@ const styles = StyleSheet.create({
   backButton: { width: 42, height: 42, borderRadius: 21, borderWidth: 1, justifyContent: 'center', alignItems: 'center' },
   headerCopy: { alignItems: 'center' },
   eyebrow: { fontSize: 10, letterSpacing: 1.4, fontFamily: 'Inter_600SemiBold', marginBottom: 4 },
-  title: { fontSize: 23, letterSpacing: -0.7, fontFamily: 'Inter_600SemiBold' },
-  intro: { fontSize: 13, lineHeight: 19, fontFamily: 'Inter_400Regular', textAlign: 'center', marginTop: 18, paddingHorizontal: 20 },
-  filterRow: { gap: 8, paddingVertical: 24 },
-  filterPill: { borderWidth: 1, paddingHorizontal: 15, height: 35, borderRadius: 18, justifyContent: 'center' },
-  filterText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
-  successBanner: { flexDirection: 'row', gap: 9, alignItems: 'center', borderRadius: 14, padding: 13, marginBottom: 18 },
-  successText: { flex: 1, fontSize: 12, fontFamily: 'Inter_500Medium' },
-  reviewHeading: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
-  reviewTitle: { fontSize: 19, fontFamily: 'Inter_600SemiBold', letterSpacing: -0.4 },
-  reviewCaption: { fontSize: 11, fontFamily: 'Inter_400Regular', marginTop: 4 },
-  aiTag: { flexDirection: 'row', gap: 5, alignItems: 'center', paddingHorizontal: 9, paddingVertical: 7, borderRadius: 12 },
-  aiTagText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
-  photoGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  photoCard: { width: '48.3%', borderRadius: 17, overflow: 'hidden' },
-  photoFrame: { height: 177, position: 'relative' },
-  photoImage: { width: '100%', height: '100%' },
-  photoCheck: { position: 'absolute', top: 10, right: 10, width: 25, height: 25, borderRadius: 13, borderWidth: 2, justifyContent: 'center', alignItems: 'center' },
-  reasonTag: { position: 'absolute', left: 9, bottom: 9, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 4 },
-  reasonText: { fontSize: 9, fontFamily: 'Inter_600SemiBold' },
-  photoMeta: { paddingHorizontal: 10, paddingVertical: 10 },
-  photoTitle: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
-  photoSize: { fontSize: 10, fontFamily: 'Inter_400Regular', marginTop: 3 },
-  keepNote: { marginTop: 20, borderWidth: 1, borderRadius: 14, padding: 13, flexDirection: 'row', alignItems: 'center', gap: 8 },
-  keepNoteText: { fontSize: 11, fontFamily: 'Inter_400Regular', flex: 1 },
-  bottomBar: { position: 'absolute', left: 0, right: 0, bottom: 0, borderTopWidth: 1, paddingHorizontal: 20, paddingTop: 13, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  selectionText: { fontSize: 12, fontFamily: 'Inter_500Medium' },
-  removeButton: { minHeight: 43, paddingHorizontal: 15, borderRadius: 22, flexDirection: 'row', alignItems: 'center', gap: 8 },
-  removeText: { fontSize: 12, fontFamily: 'Inter_700Bold' },
+  title: { fontSize: 22, letterSpacing: -0.7, fontFamily: 'Inter_600SemiBold' },
+  intro: { fontSize: 12, fontFamily: 'Inter_500Medium', textAlign: 'center', marginTop: 19, marginBottom: 5 },
+  emptyPanel: { borderWidth: 1, borderRadius: 22, alignItems: 'center', paddingHorizontal: 21, paddingVertical: 27, marginTop: 27 },
+  emptyIcon: { width: 48, height: 48, borderRadius: 17, alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
+  emptyTitle: { fontSize: 19, lineHeight: 25, textAlign: 'center', letterSpacing: -0.4, fontFamily: 'Inter_600SemiBold' },
+  emptyBody: { fontSize: 12, lineHeight: 19, textAlign: 'center', fontFamily: 'Inter_400Regular', marginTop: 8 },
+  scanButton: { minHeight: 45, paddingHorizontal: 16, borderRadius: 23, flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 20 },
+  scanButtonText: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
+  groupMeta: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 20, marginBottom: 14 },
+  groupTitle: { fontSize: 17, fontFamily: 'Inter_600SemiBold' },
+  groupCaption: { fontSize: 11, fontFamily: 'Inter_400Regular', marginTop: 4 },
+  localTag: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 9, paddingVertical: 7, borderRadius: 12 },
+  localTagText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
+  cardArea: { height: 420, position: 'relative', alignItems: 'center', marginTop: 2, marginBottom: 12 },
+  stackCard: { position: 'absolute', left: 8, right: 8, top: 0, height: 400, overflow: 'hidden', borderRadius: 23, borderWidth: 1 },
+  stackCardBack: { transform: [{ scale: 0.93 }, { translateY: 18 }], opacity: 0.6 },
+  stackCardMiddle: { transform: [{ scale: 0.965 }, { translateY: 9 }], opacity: 0.82 },
+  frontCard: { left: 0, right: 0, top: 0, height: 400, borderWidth: 1 },
+  cardImage: { width: '100%', height: '100%', resizeMode: 'cover' },
+  imageScrim: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(15, 22, 23, 0.15)' },
+  recommendedTag: { position: 'absolute', left: 14, top: 14, flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 13, paddingHorizontal: 10, paddingVertical: 7 },
+  recommendedText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
+  swipeStamp: { position: 'absolute', top: 59, borderWidth: 2, paddingHorizontal: 11, paddingVertical: 6, borderRadius: 8 },
+  keepStamp: { left: 16, transform: [{ rotate: '-12deg' }] },
+  removeStamp: { right: 16, transform: [{ rotate: '12deg' }] },
+  stampText: { fontSize: 15, letterSpacing: 1, fontFamily: 'Inter_700Bold' },
+  photoOverlay: { position: 'absolute', left: 0, right: 0, bottom: 0, paddingHorizontal: 17, paddingTop: 35, paddingBottom: 16, backgroundColor: 'rgba(15, 22, 23, 0.54)' },
+  photoName: { fontSize: 15, fontFamily: 'Inter_600SemiBold' },
+  photoDetails: { fontSize: 11, fontFamily: 'Inter_500Medium', marginTop: 5 },
+  recommendationReason: { fontSize: 11, lineHeight: 16, minHeight: 34, textAlign: 'center', fontFamily: 'Inter_400Regular', paddingHorizontal: 8 },
+  decisionRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 22, marginTop: 11, marginBottom: 19 },
+  decisionButton: { width: 52, height: 52, borderRadius: 26, alignItems: 'center', justifyContent: 'center' },
+  removeDecision: { borderWidth: 1 },
+  keepDecision: {},
+  decisionHint: { minWidth: 44, textAlign: 'center', fontSize: 11, fontFamily: 'Inter_600SemiBold' },
+  manageAccess: { marginTop: 15, borderTopWidth: 1, paddingTop: 13, flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 6 },
+  manageAccessText: { fontSize: 11, fontFamily: 'Inter_600SemiBold' },
+  rescanButton: { alignSelf: 'center', flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 12 },
+  rescanText: { fontSize: 10, fontFamily: 'Inter_500Medium' },
+  notice: { borderRadius: 12, padding: 11, flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8 },
+  noticeText: { flex: 1, fontSize: 11, fontFamily: 'Inter_500Medium' },
+  errorBox: { borderRadius: 12, padding: 12, marginTop: 12 },
+  errorText: { fontSize: 11, lineHeight: 16, fontFamily: 'Inter_500Medium' },
+  retryButton: { alignSelf: 'flex-start', marginTop: 8 },
+  retryText: { fontSize: 11, fontFamily: 'Inter_700Bold' },
+  pendingPanel: { borderWidth: 1, borderRadius: 17, padding: 13, marginTop: 16, flexDirection: 'row', alignItems: 'center', gap: 12 },
+  pendingCopy: { flex: 1 },
+  pendingTitle: { fontSize: 12, fontFamily: 'Inter_600SemiBold' },
+  pendingSubcopy: { fontSize: 10, lineHeight: 14, fontFamily: 'Inter_400Regular', marginTop: 3 },
+  removeMarkedButton: { minHeight: 40, borderRadius: 20, paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', gap: 7 },
+  removeMarkedText: { fontSize: 10, fontFamily: 'Inter_700Bold' },
 });

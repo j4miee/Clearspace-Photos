@@ -1,0 +1,1 @@
+- [Expo Media Library on web](expo-media-library-platforms.md) — keep native Media Library imports behind platform-specific adapters; the web resolver can hit native-only module code at import time.
