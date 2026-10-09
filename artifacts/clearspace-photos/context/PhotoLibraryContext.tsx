@@ -19,6 +19,7 @@ type PhotoLibraryContextValue = StoredState & {
   scannedPhotoCount: number;
   similarGroupCount: number;
   markForRemoval: (id: string) => void;
+  markManyForRemoval: (ids: string[]) => void;
   keepPhoto: (id: string) => void;
   recordDeleted: (ids: string[], bytes: number) => Promise<void>;
   setScanSummary: (photoCount: number, groupCount: number) => void;
@@ -81,6 +82,17 @@ export function PhotoLibraryProvider({ children }: { children: React.ReactNode }
     persist(next);
   };
 
+  const markManyForRemoval = (ids: string[]) => {
+    const pending = new Set(stored.pendingRemovalIds);
+    ids.forEach((id) => pending.add(id));
+    const incoming = new Set(ids);
+    persist({
+      ...stored,
+      pendingRemovalIds: [...pending],
+      keptIds: stored.keptIds.filter((keptId) => !incoming.has(keptId)),
+    });
+  };
+
   const keepPhoto = (id: string) => {
     const next: StoredState = {
       ...stored,
@@ -115,6 +127,7 @@ export function PhotoLibraryProvider({ children }: { children: React.ReactNode }
       scannedPhotoCount,
       similarGroupCount,
       markForRemoval,
+      markManyForRemoval,
       keepPhoto,
       recordDeleted,
       setScanSummary,
